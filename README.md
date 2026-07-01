@@ -53,21 +53,39 @@ That guide takes you through enabling model access, creating the IAM policy and 
 
 ---
 
-## 3. Set up an OAuth Client for Claude Code (governance)
+## 3. Set up an OAuth service account for Claude Code / AI Gateway (governance)
 
-Route Claude Code through ADP so all traffic is governed (key management, spend tracking, transcript logging) and it can reach managed MCP servers.
+Route Claude Code and direct Bedrock calls through ADP so traffic is governed: upstream keys stay in ADP, usage shows up in Cost & Usage, and transcripts can be audited.
 
-### 3a. Create a service account (OAuth client)
+### 3a. Capture the provider proxy URL, provider name, and cluster ID
+
+Open **LLM Providers** in ADP, click your Bedrock provider, and copy the **Proxy URL** from the provider's **Connection** card. It has this shape:
+
+```text
+https://aigw.<cluster-id>.clusters.rdpa.co/llm/v1/providers/<provider-name>
+```
+
+Set the values you will reuse below:
+
+```bash
+export ADP_CLUSTER_ID='<cluster-id>'          # From aigw.<cluster-id>.clusters.rdpa.co
+export ADP_PROVIDER_NAME='bedrock-adp'        # Path segment after /providers/
+export PROXY_URL="https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/llm/v1/providers/${ADP_PROVIDER_NAME}"
+```
+
+The provider name is the path segment after `/providers/`. Do not paste the full proxy URL into a role-binding resource field.
+
+### 3b. Create a service account (OAuth client)
 
 **In the Redpanda Cloud UI:**
 
-1. Go to **Organization IAM → Service account** tab → create a new service account (e.g. `llm-invoker`).
-2. **Copy the Client ID and Client Secret shown at creation time.** The secret is shown **only once** and cannot be retrieved again — store it in your secret manager immediately.
+1. Go to **Organization IAM -> Service account** tab -> create a new service account, for example `llm-invoker`.
+2. Copy the **Service Account ID**, **Client ID**, and **Client Secret** shown at creation time. The secret is shown only once and cannot be retrieved again, so store it in a secret manager immediately.
 
 **Or via the Control Plane API:**
 
 ```bash
-curl -s --request POST \
+curl -fsS --request POST \
   --url 'https://api.redpanda.com/v1/service-accounts' \
   --header 'content-type: application/json' \
   --header "authorization: Bearer <control-plane-token>" \
@@ -76,43 +94,113 @@ curl -s --request POST \
       "name": "llm-invoker",
       "description": "Service account for proxying LLM requests through AI Gateway"
     }
-  }'
-# Response includes auth0_client_credentials.client_id and auth0_client_credentials.client_secret
+  }' | jq .
 ```
 
-### 3b. Grant the `dataplane_adp_llmprovider_invoke` permission
-
-`dataplane_adp_llmprovider_invoke` is bundled in the built-in **`LLMProviderInvoker`** role — the narrowest role for applications that only proxy LLM requests through the AI Gateway. Bind **`LLMProviderInvoker`** to your service account at the appropriate scope (dataplane or organization) via ADP IAM. This grants only `dataplane_adp_llmprovider_invoke` and nothing else, following least-privilege.
-
-### 3c. Mint a token and point Claude Code at the ADP gateway
-
-Using the client ID and secret from 3a:
+Save both identifiers:
 
 ```bash
-export ANTHROPIC_AUTH_TOKEN=$(curl -s --request POST \
+export SERVICE_ACCOUNT_ID='<service-account-id>'  # Role bindings use this, not the OAuth Client ID.
+export CLIENT_ID='<oauth-client-id>'
+export CLIENT_SECRET='<oauth-client-secret>'
+```
+
+### 3c. Grant `dataplane_adp_llmprovider_invoke` at cluster scope
+
+The runtime permission needed for AI Gateway calls is `dataplane_adp_llmprovider_invoke`. It is bundled in the built-in **`LLMProviderInvoker`** role, which is the narrow role for applications that only need to proxy LLM requests through AI Gateway.
+
+For this tutorial, bind **`LLMProviderInvoker`** at the parent **Cluster** scope for the ADP cluster ID from the proxy URL:
+
+```text
+Role:      LLMProviderInvoker
+Scope:     Cluster
+Resource:  <cluster-id>
+```
+
+> Provider-level scope note: `AI Gateway Model Provider` looks like the narrowest possible scope, but this tutorial has been verified with `LLMProviderInvoker` at `SCOPE_RESOURCE_TYPE_CLUSTER`. If a provider-scoped binding is accepted but the gateway returns `403` with `lacks permission dataplane_adp_llmprovider_invoke on provider "<provider-name>"`, switch to the cluster-scope binding below.
+
+Create the binding with the Control Plane API:
+
+```bash
+export ADMIN_TOKEN='<control-plane-token>'
+
+export ROLE_BINDING_ID="$(curl -fsS -X POST 'https://api.redpanda.com/v1/role-bindings' \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  --data "$(jq -n \
+    --arg account_id "${SERVICE_ACCOUNT_ID}" \
+    --arg cluster_id "${ADP_CLUSTER_ID}" \
+    '{role_binding:{account_id:$account_id,role_name:"LLMProviderInvoker",scope:{resource_type:"SCOPE_RESOURCE_TYPE_CLUSTER",resource_id:$cluster_id}}}')" \
+  | jq -r '.role_binding.id')"
+
+echo "Created role binding: ${ROLE_BINDING_ID}"
+```
+
+If your ADP gateway is on a serverless cluster, use `SCOPE_RESOURCE_TYPE_SERVERLESS_CLUSTER` instead of `SCOPE_RESOURCE_TYPE_CLUSTER`.
+
+### 3d. Mint an access token
+
+Exchange the service account's OAuth client credentials for a short-lived access token. Do not echo this token in normal usage.
+
+```bash
+export AUTH_TOKEN="$(curl -fsS --request POST \
   --url 'https://auth.prd.cloud.redpanda.com/oauth/token' \
   --header 'content-type: application/x-www-form-urlencoded' \
   --data grant_type=client_credentials \
-  --data client_id=<client-id> \
-  --data client_secret=<client-secret> \
-  --data audience=cloudv2-production.redpanda.cloud | jq -r .access_token)
+  --data client_id="${CLIENT_ID}" \
+  --data client_secret="${CLIENT_SECRET}" \
+  --data audience=cloudv2-production.redpanda.cloud | jq -r .access_token)"
 
-export ANTHROPIC_BASE_URL="https://aigw.<cluster-id>.clusters.rdpa.co/llm/v1/providers/bedrock-adp"
+test -n "${AUTH_TOKEN}" && test "${AUTH_TOKEN}" != 'null'
 ```
 
-> **Where to find the proxy (base) URL:** open **LLM Providers** in the sidebar → click into your provider → copy the **Proxy URL** from the **Connection** card. It follows the format `https://aigw.<cluster-id>.clusters.rdpa.co/llm/v1/providers/<provider-name>` (here, `bedrock-adp`).
+Tokens expire quickly. Re-run this step before long Claude Code sessions or wrap it in a shell function.
 
-> Tokens expire quickly — wrap the `curl` above in a shell function and re-run before long sessions.
+### 3e. Smoke test the Bedrock provider through AI Gateway
 
-### 3d. Attach a managed MCP server and verify
-
-1. Attach a managed MCP server to Claude Code (OAuth-protected servers trigger a one-time consent flow; tokens are cached in ADP's per-user vault):
+Before configuring Claude Code, verify the service account can invoke the Bedrock provider directly:
 
 ```bash
-claude mcp add petstore https://aigw.<cluster-id>.clusters.rdpa.co/mcp/v1/petstore
+export BEDROCK_MODEL_ID='us.anthropic.claude-sonnet-4-6'
+
+curl -i -X POST "${PROXY_URL}/model/${BEDROCK_MODEL_ID}/invoke" \
+  -H "Authorization: Bearer ${AUTH_TOKEN}" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "anthropic_version": "bedrock-2023-05-31",
+    "messages": [{"role": "user", "content": "hello"}],
+    "max_tokens": 64
+  }'
 ```
 
-2. Verify: `claude "say hello"` — the request should appear in **Cost & Usage** within seconds.
+Expected result: `HTTP/2 200` and an Anthropic-style message body. If you get `403` with `lacks permission dataplane_adp_llmprovider_invoke`, check that:
+
+- `SERVICE_ACCOUNT_ID` is the service account ID, not the OAuth Client ID.
+- The role binding uses `SCOPE_RESOURCE_TYPE_CLUSTER` and `resource_id` equals the `<cluster-id>` from the gateway hostname.
+- You minted a fresh token after creating or changing the role binding.
+
+### 3f. Point Claude Code at the ADP gateway
+
+Claude Code reads Anthropic-style environment variables. Use the provider's **Connect** tab when available: choose **Claude Code** from the client dropdown and copy the generated environment variables or settings snippet. The proxy URL must match the provider URL exactly.
+
+```bash
+export ANTHROPIC_AUTH_TOKEN="${AUTH_TOKEN}"
+export ANTHROPIC_BASE_URL="${PROXY_URL}"
+
+claude "say hello"
+```
+
+If Claude Code fails after the Bedrock smoke test succeeds, check the provider type and the generated Connect-tab snippet. Claude Code is Anthropic-compatible, while a raw AWS Bedrock provider uses Bedrock paths such as `/model/<model-id>/invoke`; the smoke test above validates gateway authentication and RBAC for Bedrock.
+
+### 3g. Attach a managed MCP server and verify
+
+1. Attach a managed MCP server to Claude Code. OAuth-protected servers trigger a one-time consent flow, and tokens are cached in ADP's per-user vault.
+
+```bash
+claude mcp add petstore "https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/mcp/v1/petstore"
+```
+
+2. Verify with `claude "say hello"`. The request should appear in **Cost & Usage** within seconds.
 
 ---
 
