@@ -1,88 +1,111 @@
-# Redpanda Agentic Data Plane (ADP) — SE Setup Guide
+# Redpanda Agentic Data Plane (ADP) — Setup Guide
 
-A step-by-step walkthrough to stand up ADP: an LLM provider (Claude via **AWS Bedrock**), an MCP server, an OAuth client for Claude Code, a managed agent, cost/usage review, and a standalone service that triggers agent runs.
+This guide walks you through standing up a working Agentic Data Plane from scratch, using **Claude on AWS Bedrock** as the model. By the end you'll have a governed AI Gateway, a managed agent that can call tools, and a couple of ways to talk to it (Claude Code and a plain HTTP call).
 
-**Console:** [ai.redpanda.com](https://ai.redpanda.com) · **Docs:** [Quickstart](https://docs.redpanda.com/agentic-data-plane/get-started/adp-quickstart/) · [Claude Code + ADP](https://docs.redpanda.com/agentic-data-plane/connect/claude-code/)
+**What you'll build, in order:**
 
-## Prerequisites
+1. An **LLM provider** — Claude, served through AWS Bedrock.
+2. An **MCP server** — the tools your agent can call.
+3. An **OAuth service account** — so every request is authenticated and tracked.
+4. A **managed agent** — Claude + your tools, hosted by Redpanda.
+5. **Cost & usage** review — see what everything is spending.
+6. A **standalone trigger** — kick off agent runs from your own code.
 
-- ADP access with **Admin** (provider setup) or **Writer** (build) role
-- An **AWS account** with the AWS CLI configured — you'll set up Bedrock below (**do this first**)
-- `curl`, `jq`, and Claude Code installed locally [Redpanda Cupboard](https://github.com/redpanda-data/cupboard)
-- Your ADP `<cluster-id>` (from any provider's **Connection** card)
+Everything routes through ADP, so your model keys stay server-side, spend shows up in one place, and conversations can be audited.
 
-### ⚠️ Set up AWS Bedrock first — follow the guide exactly
+**Handy links:** [ADP Console](https://ai.redpanda.com) · [Quickstart](https://docs.redpanda.com/agentic-data-plane/get-started/adp-quickstart/) · [Claude Code + ADP](https://docs.redpanda.com/agentic-data-plane/connect/claude-code/)
 
-**Before anything else, complete the AWS-side Bedrock setup: [AWS_BEDROCK_SETUP.md](./AWS_BEDROCK_SETUP.md).** Follow it **exactly** — the IAM policy (including the AWS Marketplace permissions for Bedrock Marketplace engines) and the inference-profile requirement are load-bearing; skipping or altering a step causes `AccessDenied` or invalid-model errors when you register the provider in [Step 1](#1-set-up-an-llm-provider-admin).
+---
 
-That guide takes you through enabling model access, creating the IAM policy and user, and generating the access keys you'll paste into ADP. Keep the access key ID and secret handy when you reach Step 1.
+## Before you start
+
+You'll need:
+
+- **ADP access** — the **Admin** role to set up the provider, or **Writer** to build agents.
+- **An AWS account** with the AWS CLI configured. You'll set up Bedrock in a moment.
+- **`curl`, `jq`, and Claude Code** installed locally. (The [Redpanda Cupboard](https://github.com/redpanda-data/cupboard) has these.)
+- **Your ADP `<cluster-id>`** — you'll find it on any provider's **Connection** card.
+
+### ⚠️ Do the AWS Bedrock setup first
+
+Before anything else, work through **[AWS_BEDROCK_SETUP.md](./AWS_BEDROCK_SETUP.md)** — and follow it exactly.
+
+It's short, but the details matter: the IAM policy needs the right permissions (including AWS Marketplace access for Bedrock's Marketplace engines), and current Claude models are only reachable through *inference profiles*, not plain model IDs. Skip or change a step and you'll hit `AccessDenied` or "invalid model" errors the moment you try to register the provider in Step 1.
+
+When you're done, you'll have an AWS access key ID and secret access key. **Keep them handy** — you'll paste them into ADP in the next step.
 
 ---
 
 ## 1. Set up an LLM Provider (Admin)
 
-> Complete the [AWS Bedrock setup](./AWS_BEDROCK_SETUP.md) first — this step uses the IAM user's access keys you generated there. **Static keys** is the credential type that matches that setup.
+This is where you connect ADP to Claude on Bedrock. You'll create a provider, hand it your AWS credentials, and pick which models it's allowed to serve.
 
-1. In ADP, open **LLM Providers → Create provider**.
-2. **Display name**: `bedrock-adp` · **Provider type**: `AWS Bedrock`.
-3. **Region**: the AWS region where Bedrock is deployed, e.g. `us-east-1`.
-4. Pick a **Credential type**:
-   - **Static keys** — under each **secret reference → New**, create `AWS_ACCESS_KEY_ID` (**Access key ID reference**) and `AWS_SECRET_ACCESS_KEY` (**Secret access key reference**), paste the values, **Create secret**.
-   - **Assume IAM role** — supply the **Role ARN** the AI Gateway assumes via AWS STS (no long-lived keys to manage).
-   - **Default chain** — uses the AWS SDK default provider chain (environment variables, shared config, EKS Pod Identity, IRSA, or instance profile) when the gateway already runs with an AWS identity.
-5. Select models by their **Bedrock inference profile ID** — Claude 4.6+ requires a geographic inference profile, not a bare foundation-model ID:
-   - `global.anthropic.claude-opus-4-7` (any region, lowest cost — good default)
-   - `us.anthropic.claude-sonnet-4-6` / `eu.anthropic.claude-sonnet-4-6` (cheaper/faster, region-scoped)
-   - `us.anthropic.claude-haiku-4-5` / `eu.anthropic.claude-haiku-4-5` (fastest/cheapest)
+> Finish the [AWS Bedrock setup](./AWS_BEDROCK_SETUP.md) first — this step uses the access keys you created there, and **Static keys** (below) is the matching credential type.
 
-   (Older 4.5-and-earlier models accept bare IDs like `anthropic.claude-sonnet-4-5`.) → **Create provider**.
-6. Confirm the badge reads **Enabled / Active**.
+1. In ADP, go to **LLM Providers → Create provider**.
+2. Give it a **Display name** of `bedrock-adp` and set **Provider type** to `AWS Bedrock`.
+3. Set the **Region** to wherever your Bedrock models live — for example, `us-east-1`.
+4. Choose a **Credential type**. Most people want the first one:
+   - **Static keys** *(recommended for this guide)* — under each **secret reference → New**, create `AWS_ACCESS_KEY_ID` (the **Access key ID reference**) and `AWS_SECRET_ACCESS_KEY` (the **Secret access key reference**), paste the values from the Bedrock setup, and **Create secret**.
+   - **Assume IAM role** — give ADP a **Role ARN** to assume via AWS STS. No long-lived keys to manage.
+   - **Default chain** — lets the gateway use the AWS SDK's default credential chain (env vars, shared config, EKS Pod Identity, IRSA, instance profile). Use this only if the gateway already runs with an AWS identity.
+5. Pick your models. **Current Claude models (4.6+) must be selected by their Bedrock *inference profile ID*** — a plain model ID won't work:
+   - `global.anthropic.claude-opus-4-7` — works in any region, no cross-region premium. A good default.
+   - `us.anthropic.claude-sonnet-4-6` / `eu.anthropic.claude-sonnet-4-6` — cheaper and faster, tied to a region.
+   - `us.anthropic.claude-haiku-4-5` / `eu.anthropic.claude-haiku-4-5` — fastest and cheapest.
 
-> Bedrock model IDs differ from the first-party Claude API — always use the `<geo>.anthropic.<model>` inference-profile form for current models. If a model errors with an invalid-model or access-denied message, verify it's enabled under **Model access** in the Bedrock console for that region and that your IAM principal covers its ARN.
+   *(Older 4.5-and-earlier models still accept plain IDs like `anthropic.claude-sonnet-4-5`.)* Then click **Create provider**.
+6. Check that the provider badge shows **Enabled / Active**. You're connected.
+
+> **If a model errors out:** Bedrock model IDs aren't the same as the first-party Claude API IDs — always use the `<geo>.anthropic.<model>` inference-profile form. An "invalid model" or "access denied" error almost always means the model isn't enabled under **Model access** in the Bedrock console for that region, or your IAM policy doesn't cover it.
 
 ---
 
-## 2. Set up an MCP Server + curate its tools (Builder)
+## 2. Set up an MCP Server and curate its tools (Builder)
 
-1. Open **MCP Servers → Create server**, pick a connector from the marketplace (e.g. `OpenAPI`).
-![openapi](https://docs.redpanda.com/agentic-data-plane/get-started/_images/create-mcp-server-picker.png)
-2. **Name**: `petstore` · **Spec**: `https://petstore3.swagger.io/api/v3/openapi.json` · **Auth**: `None` → **Create**.
-3. Open the **Inspector** tab to **enumerate every tool** the server exposes (e.g. `findpetsbystatus`, `getpetbyid`, `addpet`, `deletepet`, …).
-4. **Curate the tool list** — verbose servers dump dozens of tools into the model's context, wasting tokens and inviting misuse. In the server's tool config, disable everything the agent doesn't need (keep read tools, drop writes/deletes). A tight, curated list = smaller context + safer agent.
-5. Copy the server's **API URL** from the detail page for later.
+An MCP server is where your agent's tools come from. We'll use the public Swagger Petstore as a stand-in for a real API.
+
+1. Go to **MCP Servers → Create server** and pick a connector from the marketplace — `OpenAPI` for this example.
+   ![openapi](https://docs.redpanda.com/agentic-data-plane/get-started/_images/create-mcp-server-picker.png)
+2. Name it `petstore`, set the **Spec** to `https://petstore3.swagger.io/api/v3/openapi.json`, leave **Auth** as `None`, and **Create**.
+3. Open the **Inspector** tab to see every tool the server exposes — you'll spot things like `findpetsbystatus`, `getpetbyid`, `addpet`, and `deletepet`.
+4. **Trim the tool list down to what the agent actually needs.** A chatty server dumps dozens of tools into the model's context — that wastes tokens and invites the agent to do things you didn't intend. Disable everything you don't need (keep the read tools, drop the writes and deletes). A short, deliberate list means a smaller context window and a safer agent.
+5. Copy the server's **API URL** from its detail page — you'll want it later.
 
 ---
 
 ## 3. Set up an OAuth service account for Claude Code / AI Gateway (governance)
 
-Route Claude Code and direct Bedrock calls through ADP so traffic is governed: upstream keys stay in ADP, usage shows up in Cost & Usage, and transcripts can be audited.
+So far the provider works, but nothing outside ADP can reach it yet. This step creates a service account, gives it exactly one permission (invoke the gateway, nothing more), and gets you a token you can use from Claude Code or your own scripts.
 
-### 3a. Capture the provider proxy URL, provider name, and cluster ID
+This is the part that trips people up most, so it's broken into small, verifiable steps.
 
-Open **LLM Providers** in ADP, click your Bedrock provider, and copy the **Proxy URL** from the provider's **Connection** card. It has this shape:
+### 3a. Grab your proxy URL, provider name, and cluster ID
+
+Open **LLM Providers**, click your Bedrock provider, and copy the **Proxy URL** from its **Connection** card. It looks like this:
 
 ```text
 https://aigw.<cluster-id>.clusters.rdpa.co/llm/v1/providers/<provider-name>
 ```
 
-Set the values you will reuse below:
+Save the pieces you'll reuse throughout this step:
 
 ```bash
-export ADP_CLUSTER_ID='<cluster-id>'          # From aigw.<cluster-id>.clusters.rdpa.co
-export ADP_PROVIDER_NAME='bedrock-adp'        # Path segment after /providers/
+export ADP_CLUSTER_ID='<cluster-id>'          # the part in aigw.<cluster-id>.clusters.rdpa.co
+export ADP_PROVIDER_NAME='bedrock-adp'        # the path segment after /providers/
 export PROXY_URL="https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/llm/v1/providers/${ADP_PROVIDER_NAME}"
 ```
 
-The provider name is the path segment after `/providers/`. Do not paste the full proxy URL into a role-binding resource field.
+The provider name is just the last path segment (`bedrock-adp` here). One thing to watch: when you set up the role binding below, use the bare cluster ID — **not** the full proxy URL.
 
-### 3b. Create a service account (OAuth client)
+### 3b. Create a service account
 
 **In the Redpanda Cloud UI:**
 
-1. Go to **Organization IAM -> Service account** tab -> create a new service account, for example `llm-invoker`.
-2. Copy the **Service Account ID**, **Client ID**, and **Client Secret** shown at creation time. The secret is shown only once and cannot be retrieved again, so store it in a secret manager immediately.
+1. Go to **Organization IAM → Service account** and create a new one — call it `llm-invoker`.
+2. Copy the **Service Account ID**, **Client ID**, and **Client Secret** right away. The secret is shown **only once**, so save it to a secret manager before you close the dialog.
 
-**Or via the Control Plane API:**
+**Or, from the Control Plane API:**
 
 ```bash
 curl -fsS --request POST \
@@ -97,19 +120,21 @@ curl -fsS --request POST \
   }' | jq .
 ```
 
-Save both identifiers:
+Either way, save all three values — you'll need each of them below:
 
 ```bash
-export SERVICE_ACCOUNT_ID='<service-account-id>'  # Role bindings use this, not the OAuth Client ID.
+export SERVICE_ACCOUNT_ID='<service-account-id>'  # role bindings use THIS, not the Client ID
 export CLIENT_ID='<oauth-client-id>'
 export CLIENT_SECRET='<oauth-client-secret>'
 ```
 
-### 3c. Grant `dataplane_adp_llmprovider_invoke` at cluster scope
+> ⚠️ The **Service Account ID** and the **Client ID** are different values that look alike. Role bindings use the *Service Account ID*. Mixing these up is the #1 cause of the `403` errors in [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
 
-The runtime permission needed for AI Gateway calls is `dataplane_adp_llmprovider_invoke`. It is bundled in the built-in **`LLMProviderInvoker`** role, which is the narrow role for applications that only need to proxy LLM requests through AI Gateway.
+### 3c. Grant it permission to call the gateway
 
-For this tutorial, bind **`LLMProviderInvoker`** at the parent **Cluster** scope for the ADP cluster ID from the proxy URL:
+The only permission the service account needs is `dataplane_adp_llmprovider_invoke`. That comes bundled in the built-in **`LLMProviderInvoker`** role — the narrowest role for something that just proxies LLM requests.
+
+For this guide, bind `LLMProviderInvoker` at the **Cluster** scope, using the cluster ID from your proxy URL:
 
 ```text
 Role:      LLMProviderInvoker
@@ -117,9 +142,9 @@ Scope:     Cluster
 Resource:  <cluster-id>
 ```
 
-> Provider-level scope note: `AI Gateway Model Provider` looks like the narrowest possible scope, but this tutorial has been verified with `LLMProviderInvoker` at `SCOPE_RESOURCE_TYPE_CLUSTER`. If a provider-scoped binding is accepted but the gateway returns `403` with `lacks permission dataplane_adp_llmprovider_invoke on provider "<provider-name>"`, switch to the cluster-scope binding below.
+> **Why cluster scope?** The `AI Gateway Model Provider` scope looks like the tighter, more "correct" choice — but in testing, a provider-scoped binding is accepted and then the gateway still returns `403 lacks permission dataplane_adp_llmprovider_invoke on provider "<provider-name>"`. Cluster scope is the combination that actually works.
 
-Create the binding with the Control Plane API:
+Create the binding through the Control Plane API:
 
 ```bash
 export ADMIN_TOKEN='<control-plane-token>'
@@ -136,11 +161,11 @@ export ROLE_BINDING_ID="$(curl -fsS -X POST 'https://api.redpanda.com/v1/role-bi
 echo "Created role binding: ${ROLE_BINDING_ID}"
 ```
 
-If your ADP gateway is on a serverless cluster, use `SCOPE_RESOURCE_TYPE_SERVERLESS_CLUSTER` instead of `SCOPE_RESOURCE_TYPE_CLUSTER`.
+> On a **serverless** cluster, swap `SCOPE_RESOURCE_TYPE_CLUSTER` for `SCOPE_RESOURCE_TYPE_SERVERLESS_CLUSTER`.
 
-### 3d. Mint an access token
+### 3d. Get an access token
 
-Exchange the service account's OAuth client credentials for a short-lived access token. Do not echo this token in normal usage.
+Trade the service account's client ID and secret for a short-lived access token:
 
 ```bash
 export AUTH_TOKEN="$(curl -fsS --request POST \
@@ -151,14 +176,15 @@ export AUTH_TOKEN="$(curl -fsS --request POST \
   --data client_secret="${CLIENT_SECRET}" \
   --data audience=cloudv2-production.redpanda.cloud | jq -r .access_token)"
 
+# quick sanity check — should print nothing and exit 0
 test -n "${AUTH_TOKEN}" && test "${AUTH_TOKEN}" != 'null'
 ```
 
-Tokens expire quickly. Re-run this step before long Claude Code sessions or wrap it in a shell function.
+These tokens don't live long. Re-run this before a long Claude Code session, or wrap it in a shell function so it's always fresh. (And don't echo the token around — treat it like a password.)
 
-### 3e. Smoke test the Bedrock provider through AI Gateway
+### 3e. Smoke-test the provider
 
-Before configuring Claude Code, verify the service account can invoke the Bedrock provider directly:
+Before wiring up Claude Code, confirm the token and permissions actually work by calling Bedrock through the gateway directly:
 
 ```bash
 export BEDROCK_MODEL_ID='us.anthropic.claude-sonnet-4-6'
@@ -173,15 +199,15 @@ curl -i -X POST "${PROXY_URL}/model/${BEDROCK_MODEL_ID}/invoke" \
   }'
 ```
 
-Expected result: `HTTP/2 200` and an Anthropic-style message body. If you get `403` with `lacks permission dataplane_adp_llmprovider_invoke`, check that:
+You want to see `HTTP/2 200` and a normal Claude-style reply. If you instead get a `403 lacks permission dataplane_adp_llmprovider_invoke`, it's almost always one of these — see [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) for the full checklist:
 
-- `SERVICE_ACCOUNT_ID` is the service account ID, not the OAuth Client ID.
-- The role binding uses `SCOPE_RESOURCE_TYPE_CLUSTER` and `resource_id` equals the `<cluster-id>` from the gateway hostname.
-- You minted a fresh token after creating or changing the role binding.
+- You used the **Client ID** instead of the **Service Account ID** in the role binding.
+- The binding isn't at **cluster scope**, or its `resource_id` doesn't match your `<cluster-id>`.
+- You're using a token minted *before* the role binding existed — grab a fresh one (3d).
 
-### 3f. Point Claude Code at the ADP gateway
+### 3f. Point Claude Code at the gateway
 
-Claude Code reads Anthropic-style environment variables. Use the provider's **Connect** tab when available: choose **Claude Code** from the client dropdown and copy the generated environment variables or settings snippet. The proxy URL must match the provider URL exactly.
+Claude Code speaks the Anthropic API, and it reads its config from environment variables. Point it at your proxy URL and hand it the token:
 
 ```bash
 export ANTHROPIC_AUTH_TOKEN="${AUTH_TOKEN}"
@@ -190,54 +216,60 @@ export ANTHROPIC_BASE_URL="${PROXY_URL}"
 claude "say hello"
 ```
 
-If Claude Code fails after the Bedrock smoke test succeeds, check the provider type and the generated Connect-tab snippet. Claude Code is Anthropic-compatible, while a raw AWS Bedrock provider uses Bedrock paths such as `/model/<model-id>/invoke`; the smoke test above validates gateway authentication and RBAC for Bedrock.
+> **Tip:** the provider's **Connect** tab can generate this snippet for you — pick **Claude Code** from the client dropdown and copy what it gives you. Just make sure the base URL matches your provider URL exactly.
 
-### 3g. Attach a managed MCP server and verify
+If the smoke test in 3e passed but Claude Code doesn't work, the mismatch is usually the provider type or the base URL. Claude Code talks the Anthropic API, whereas a raw Bedrock provider uses Bedrock-style paths like `/model/<model-id>/invoke` (which is exactly what 3e exercised).
 
-1. Attach a managed MCP server to Claude Code. OAuth-protected servers trigger a one-time consent flow, and tokens are cached in ADP's per-user vault.
+### 3g. Attach a managed MCP server and confirm
 
-```bash
-claude mcp add petstore "https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/mcp/v1/petstore"
-```
+1. Connect the MCP server from Step 2 to Claude Code. OAuth-protected servers pop a one-time consent flow, and tokens get cached in ADP's per-user vault.
 
-2. Verify with `claude "say hello"`. The request should appear in **Cost & Usage** within seconds.
+   ```bash
+   claude mcp add petstore "https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/mcp/v1/petstore"
+   ```
+
+2. Run `claude "say hello"` — the request should show up in **Cost & Usage** within seconds. That's your confirmation the whole path is wired up.
 
 ---
 
 ## 4. Build an Agent (Builder)
 
-1. Open **Agents → Create agent → Redpanda manages it**.
-2. **Details**: name `pet-store-assistant`, add a description.
-3. **Model**: provider `bedrock-adp`, model `us.anthropic.claude-sonnet-4-6`.
-4. **Behavior** — system prompt:
+Now the fun part: a hosted agent that combines Claude with the tools you curated.
 
-```
-You are a pet store inventory assistant with access to PetStore MCP tools.
-- Always call a tool before answering.
-- After each call, summarize and cite the tool name.
-- Read operations only; if a tool fails, say so and stop.
-```
+1. Go to **Agents → Create agent → Redpanda manages it**.
+2. Under **Details**, name it `pet-store-assistant` and add a short description.
+3. For the **Model**, pick provider `bedrock-adp` and model `us.anthropic.claude-sonnet-4-6`.
+4. Set the **system prompt** under **Behavior**:
 
-5. **Tools**: attach the `petstore` MCP server (curated list from Step 2).
-6. **Create agent**, wait for **Starting → Running**, then test in the **Inspector** tab (e.g. *"What pets are available right now?"*). Use **Clear context** between tests.
+   ```
+   You are a pet store inventory assistant with access to PetStore MCP tools.
+   - Always call a tool before answering.
+   - After each call, summarize and cite the tool name.
+   - Read operations only; if a tool fails, say so and stop.
+   ```
 
-### Bonus — subagent to tame a verbose MCP server
+5. Under **Tools**, attach the `petstore` MCP server — the trimmed-down list from Step 2.
+6. **Create agent** and wait for it to go **Starting → Running**. Then test it in the **Inspector** tab — try *"What pets are available right now?"* Use **Clear context** between tests so old messages don't leak in.
 
-Add a **subagent** whose only job is data extraction against the noisy MCP server. Give the subagent the full tool list; give the parent agent a curated set plus the subagent. The parent delegates a focused query, the subagent does the multi-tool digging and returns a compact result — keeping the raw tool sprawl out of the parent's context window.
+### Bonus: use a subagent to tame a noisy MCP server
+
+If a server exposes a firehose of tools, give a **subagent** the full list and have it do the digging. The parent agent gets a curated set plus the subagent, delegates a focused question, and receives a tidy answer back — so all that raw tool sprawl never clutters the parent's context.
 
 ---
 
 ## 5. Review Cost & Usage
 
-- **Home dashboard**: request/spend activity and budget status.
-- **Cost & Usage / Governance**: filter by provider on the **Requests over time** chart to attribute spend per agent/client.
-- **Transcripts** (if logging enabled): full conversation history per provider for auditing.
+Once traffic is flowing, ADP shows you where the money and requests are going:
+
+- **Home dashboard** — request and spend activity at a glance, plus budget status.
+- **Cost & Usage / Governance** — filter the **Requests over time** chart by provider to see spend per agent or client.
+- **Transcripts** *(if logging is on)* — the full conversation history per provider, for auditing.
 
 ---
 
-## 6. Integrate a Standalone Service to Trigger an Agent Run
+## 6. Trigger an agent run from your own service
 
-Call the ADP agent endpoint from any external service and capture the output. Reuse the OAuth token flow from Step 3.
+You don't have to use Claude Code — any service can call the agent over HTTP. It reuses the same OAuth flow from Step 3.
 
 ```bash
 #!/usr/bin/env bash
@@ -260,12 +292,20 @@ curl -s --request POST \
 | tee agent-output.json | jq -r '.output'
 ```
 
-- Set `ADP_CLIENT_ID`, `ADP_CLIENT_SECRET`, `CLUSTER_ID` as env vars in your service.
-- The response is captured to `agent-output.json`; the run is also logged in Cost & Usage / Transcripts.
-- Confirm the exact agent run path against your ADP console's agent **Connection** card — endpoints vary by ADP version.
+A few notes:
+
+- Set `ADP_CLIENT_ID`, `ADP_CLIENT_SECRET`, and `CLUSTER_ID` as environment variables in your service.
+- The reply is saved to `agent-output.json`, and the run also shows up in Cost & Usage / Transcripts.
+- Double-check the exact agent run path against the agent's **Connection** card in the console — endpoints can vary by ADP version.
+
+---
+
+## Troubleshooting
+
+Seeing `403 lacks permission dataplane_adp_llmprovider_invoke` or another gateway auth error? **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** has the full role-binding checklist — wrong identity, wrong scope, stale tokens, propagation delays — plus how to tell `401`, `403`, and `404` apart.
 
 ---
 
 ## Cleanup
 
-Delete in order: **Agent → MCP server → LLM provider**, then optionally remove the credential secrets (or, if you used an assumed IAM role, revoke/rotate it in AWS).
+When you're done, tear things down in this order: **Agent → MCP server → LLM provider**. Then, optionally, remove the credential secrets — or, if you used an assumed IAM role, revoke or rotate it in AWS.
