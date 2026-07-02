@@ -27,6 +27,72 @@ Everything routes through ADP, so your model keys stay server-side, spend shows 
 
 ---
 
+## Workflow at a glance
+
+```mermaid
+flowchart TD
+    subgraph AWS["☁️ AWS (do this first)"]
+        BR["AWS_BEDROCK_SETUP.md<br/>Enable models · IAM policy · access keys"]
+    end
+
+    subgraph ADP["🐼 Redpanda ADP"]
+        P["Step 1 · LLM Provider<br/>Claude on Bedrock"]
+        M["Step 2 · MCP Server<br/>enumerate + curate tools"]
+        O["Step 3 · OAuth service account<br/>token + LLMProviderInvoker @ cluster scope"]
+        A["Step 4 · Managed Agent<br/>Claude + curated tools (+ subagent)"]
+        C["Step 5 · Cost &amp; Usage<br/>spend, requests, transcripts"]
+    end
+
+    subgraph CLIENTS["🧑‍💻 Ways to call it"]
+        CC["Claude Code<br/>via the gateway"]
+        SVC["Step 6 · Standalone service<br/>HTTP run + capture output"]
+    end
+
+    BR --> P
+    P --> M --> O --> A --> C
+    O -. bearer token .-> CC
+    O -. bearer token .-> SVC
+    M -. managed MCP tools .-> CC
+    A -. agent runs .-> SVC
+
+    classDef aws fill:#fff3e0,stroke:#e8873a,color:#000;
+    classDef adp fill:#fde7ef,stroke:#e0398a,color:#000;
+    classDef client fill:#e8f0fe,stroke:#3a6de8,color:#000;
+    class BR aws;
+    class P,M,O,A,C adp;
+    class CC,SVC client;
+```
+
+The path: set up Bedrock on AWS → register it as a **provider** in ADP → expose **tools** via MCP → mint a governed **identity** (OAuth service account) → assemble a **managed agent** → watch **cost & usage**. From there, both **Claude Code** and **your own services** reach everything through the gateway, so every request is authenticated, curated, and recorded.
+
+---
+
+## Table of contents
+
+- [Before you start](#before-you-start)
+  - [⚠️ Do the AWS Bedrock setup first](#️-do-the-aws-bedrock-setup-first)
+- [1. Set up an LLM Provider (Admin)](#1-set-up-an-llm-provider-admin)
+- [2. Set up an MCP Server and curate its tools (Builder)](#2-set-up-an-mcp-server-and-curate-its-tools-builder)
+- [3. Set up an OAuth service account for Claude Code / AI Gateway (governance)](#3-set-up-an-oauth-service-account-for-claude-code--ai-gateway-governance)
+  - [3a. Grab your proxy URL, provider name, and cluster ID](#3a-grab-your-proxy-url-provider-name-and-cluster-id)
+  - [3b. Get a Control Plane admin token (for setup only)](#3b-get-a-control-plane-admin-token-for-setup-only)
+  - [3c. Create a service account](#3c-create-a-service-account)
+  - [3d. Grant it permission to call the gateway](#3d-grant-it-permission-to-call-the-gateway)
+  - [3e. Get a runtime access token](#3e-get-a-runtime-access-token)
+  - [3f. Smoke-test the provider](#3f-smoke-test-the-provider)
+  - [3g. Point Claude Code at the gateway](#3g-point-claude-code-at-the-gateway)
+  - [3h. Attach a managed MCP server and confirm](#3h-attach-a-managed-mcp-server-and-confirm)
+- [4. Build an Agent (Builder)](#4-build-an-agent-builder)
+  - [Bonus: use a subagent to tame a noisy MCP server](#bonus-use-a-subagent-to-tame-a-noisy-mcp-server)
+- [5. Review Cost & Usage](#5-review-cost--usage)
+- [6. Trigger an agent run from your own service](#6-trigger-an-agent-run-from-your-own-service)
+- [Troubleshooting](#troubleshooting)
+- [Cleanup](#cleanup)
+
+Companion docs: [AWS_BEDROCK_SETUP.md](./AWS_BEDROCK_SETUP.md) · [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) · [PRESENTATION_PROMPT.md](./PRESENTATION_PROMPT.md)
+
+---
+
 ## Before you start
 
 You'll need:
