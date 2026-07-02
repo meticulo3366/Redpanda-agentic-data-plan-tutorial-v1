@@ -12,7 +12,18 @@ Adjust the **audience**, **length**, and **format** lines at the top to fit your
 
 ## The prompt
 
-> You are helping me build a technical value presentation about Redpanda's **Agentic Data Plane (ADP)**. The deck must lead with Redpanda's value drivers and then *prove* them by walking through a real onboarding: standing up ADP with Claude on AWS Bedrock, and using it from Claude Code and a standalone service. This is a "why ADP, shown live" story — not a feature list.
+> You are helping me build a technical value presentation about Redpanda's **Agentic Data Plane (ADP)**. The deck must lead with Redpanda's value drivers and then *prove* them by guiding the audience through a real, hands-on onboarding exercise: standing up ADP with Claude on AWS Bedrock, and using it from Claude Code and a standalone service. This is a "why ADP, shown live" story — not a feature list. Attendees are expected to actually perform the exercise, so the deck should present it as guided hands-on steps, each with a clear "you'll do X, and here's what to notice."
+>
+> ### The hands-on exercise (this is the spine of Part 2 — cover every item)
+>
+> The attendee walks through these six tasks, in order. This is the source of truth; do not drop or reorder them:
+>
+> 1. **Set up an LLM provider** — connect ADP to Claude on AWS Bedrock.
+> 2. **Set up an MCP server** — and understand the *full agent MCP tool enumeration*, then use **ADP's ability to curate the tool list to reduce context waste** (disable the tools the agent doesn't need).
+> 3. **Set up an OAuth client** — show that Claude Code can run *through ADP* for governance, and that it can reach **managed MCP servers** that way.
+> 4. **Build an agent** — and, for bonus points, **use a subagent to extract data from a verbose MCP server** (the subagent holds the full noisy tool list and returns a compact result to the parent).
+> 5. **Review the agent's cost and usage** — in ADP's Cost & Usage views.
+> 6. **Integrate a standalone service** — initiate an agent run from external code and **capture its output**.
 >
 > **Audience:** solutions engineers and platform/developer teams evaluating ADP; comfortable with AWS and APIs, new to Redpanda ADP. *(Change if your audience differs.)*
 > **Length:** ~14–16 slides, ~25-minute talk. *(Adjust as needed.)*
@@ -37,14 +48,14 @@ Adjust the **audience**, **length**, and **format** lines at the top to fit your
 > 3. **The promise** — see, control, and trust every AI agent you run. Introduce the 3 Cs (Connect / Control / Operate) as the through-line for the rest of the deck.
 > 4. **One-slide architecture** — the request path and where governance happens: `Developer / Claude Code / a service` → (OIDC bearer token) → `Redpanda ADP AI Gateway` (holds provider creds, enforces RBAC, meters + records) → `AWS Bedrock` → `Claude (inference profile, e.g. us.anthropic.claude-sonnet-4-6)`. Show MCP tool servers and managed agents living behind the same gateway. Label each hop with the pillar it serves.
 >
-> **Part 2 — Prove it with the onboarding (map each step to a pillar):**
-> 5. **Connect: the LLM provider** *(Connect)* — plug Claude-on-Bedrock into ADP once; upstream AWS credentials live in ADP, not in every developer's shell. Note current Claude models use Bedrock *inference profile IDs* (`global.`/`us.`/`eu.` prefixes), not bare IDs.
-> 6. **Connect: MCP tools** *(Connect)* — register a tool server (Petstore OpenAPI demo) and *curate the tool list* so agents get exactly the tools they need — smaller context, safer behavior.
-> 7. **Control: identity + least-privilege** *(Control)* — the OAuth service account. Make the authentication-vs-authorization split explicit: Client ID + Secret mint a short-lived token (*who you are*); a Redpanda role binding decides *what you can do*. Runtime permission `dataplane_adp_llmprovider_invoke` via the built-in `LLMProviderInvoker` role at **cluster scope**. Call out the two look-alike IDs (Service Account ID for bindings vs. OAuth Client ID for tokens) — mixing them up is the #1 cause of `403`s.
-> 8. **Control: budgets & routing** *(Control)* — connect the hands-on RBAC to the broader Control story: token budgets, spend limits, LLM routing/failover, data redaction. (Conceptual — reinforces the pillar beyond what the tutorial configures.)
-> 9. **Build the agent** *(Connect + Control)* — a Redpanda-managed agent = Claude + curated MCP tools + a system prompt, testable in the Inspector. Mention multi-agent/sub-agent orchestration as the scale story.
-> 10. **Operate: cost & usage** *(Operate)* — the governance payoff made visible: spend and requests per provider/agent/client, transcripts for audit, and the "kill switch" concept for stopping a bad agent.
-> 11. **Operate: call it from anywhere** *(Operate/Connect)* — trigger an agent run over plain HTTP from any service using the same OIDC flow; every call is still governed and recorded.
+> **Part 2 — Do the exercise (one slide per task; map each to a pillar):**
+> 5. **Exercise 1 — Set up the LLM provider** *(Connect)* — plug Claude-on-Bedrock into ADP once; upstream AWS credentials live in ADP, not in every developer's shell. Note current Claude models use Bedrock *inference profile IDs* (`global.`/`us.`/`eu.` prefixes), not bare IDs. *What to notice:* one governed front door instead of scattered keys.
+> 6. **Exercise 2 — Set up an MCP server + curate the tools** *(Connect)* — register a tool server (Petstore OpenAPI demo) and open the **Inspector to enumerate the full tool list the agent would otherwise see**. Then use **ADP to curate that list down** — disable the writes/deletes and anything unneeded. *What to notice:* every extra tool is wasted context and extra risk; ADP lets you trim it centrally, so the agent gets a tight, safe toolset.
+> 7. **Exercise 3 — Set up an OAuth client (Claude Code through ADP)** *(Control)* — create the service account so **Claude Code runs *through* ADP** (governed: keys stay server-side, usage tracked, transcripts auditable) **and can reach managed MCP servers** over the gateway. Make the authentication-vs-authorization split explicit: Client ID + Secret mint a short-lived token (*who you are*); a Redpanda role binding decides *what you can do* — `dataplane_adp_llmprovider_invoke` via the built-in `LLMProviderInvoker` role at **cluster scope**. Call out the two look-alike IDs (Service Account ID for bindings vs. OAuth Client ID for tokens) — mixing them up is the #1 cause of `403`s. *What to notice:* the developer's everyday tool is now fully governed with zero raw keys on the laptop.
+> 8. **Control, at scale** *(Control)* — connect that hands-on RBAC to the broader Control story ADP offers: token budgets, spend limits, LLM routing/failover, on-behalf-of auth, data redaction. (Conceptual bridge — reinforces the pillar beyond what the exercise configures.)
+> 9. **Exercise 4 — Build an agent (+ subagent bonus)** *(Connect + Control)* — a Redpanda-managed agent = Claude + the curated MCP tools + a system prompt, testable in the Inspector. **Bonus, worth its own callout:** add a **subagent that extracts data from a verbose MCP server** — the subagent carries the full noisy tool list and does the multi-tool digging, then returns a compact result to the parent, keeping tool sprawl out of the parent's context window. *What to notice:* orchestration (parent + specialized subagent) is how you scale past single-player mode.
+> 10. **Exercise 5 — Review cost & usage** *(Operate)* — the governance payoff made visible: spend and requests per provider/agent/client, transcripts for audit, and the "kill switch" concept for stopping a bad agent. *What to notice:* you can see and attribute every request and dollar.
+> 11. **Exercise 6 — Integrate a standalone service** *(Operate/Connect)* — trigger an agent run over plain HTTP from external code using the same OIDC flow, and **capture the output** (e.g. to a file). *What to notice:* agents become callable building blocks, and every external call is still governed and recorded.
 >
 > **Part 3 — Make it real & land it:**
 > 12. **From clicks to one command** — the `adp-claude-code-service-account-auth.sh` wrapper collapses the whole Control step into one command (create service account, bind the role at cluster scope, mint a token, smoke-test Bedrock, write Claude Code settings, launch Claude Code), persisting creds to a git-ignored env file. Frame it as "understand it manually once, then automate it."
@@ -54,7 +65,9 @@ Adjust the **audience**, **length**, and **format** lines at the top to fit your
 > 16. **Appendix** — repo file map (`README.md`, `AWS_BEDROCK_SETUP.md`, `adp-claude-code-service-account-auth.sh`, `TROUBLESHOOTING.md`) and links.
 >
 > ### Guardrails
-> - **Value drivers lead; the tutorial is the evidence.** Every onboarding slide should visibly tie back to Connect / Control / Operate — don't let it drift into a pure click-through.
+> - **Value drivers lead; the exercise is the evidence.** Every onboarding slide should visibly tie back to Connect / Control / Operate — don't let it drift into a pure click-through.
+> - **Cover all six exercise tasks, in order, one slide each** (Exercises 1–6 above). Do not merge or skip any. Preserve the two specific emphases the exercise calls out: (a) MCP tool *enumeration → curation* to cut context waste, and (b) the **subagent that extracts data from a verbose MCP server** as the agent-building bonus.
+> - **Frame each exercise slide as an action the attendee performs** — a short "you'll do…" plus a "what to notice" that ties to the pillar — since attendees run this live.
 > - Use **placeholders** for every credential, cluster ID, provider name, account ID, and token (`<cluster-id>`, `<service-account-id>`, `<control-plane-token>`, etc.). Never invent or include anything resembling a real secret or real infrastructure ID.
 > - Keep model IDs accurate: current Claude on Bedrock uses inference-profile IDs like `global.anthropic.claude-opus-4-7`, `us.anthropic.claude-sonnet-4-6`, `us.anthropic.claude-haiku-4-5`.
 > - Mirror the README's numbering when referencing steps (Steps 1–6; Step 3 is 3a–3h) so the deck and guide line up.
