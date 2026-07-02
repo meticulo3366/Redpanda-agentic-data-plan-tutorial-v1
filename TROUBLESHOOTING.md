@@ -24,7 +24,7 @@ curl -fsS 'https://api.redpanda.com/v1/role-bindings' \
       '.role_bindings[] | select(.account_id == $id) | {id, role_name, scope}'
 ```
 
-If that prints nothing, the binding was made against the wrong ID. Recreate it (README 3c) with `account_id = ${SERVICE_ACCOUNT_ID}`.
+If that prints nothing, the binding was made against the wrong ID. Recreate it (README 3d) with `account_id = ${SERVICE_ACCOUNT_ID}`.
 
 ### 2. The scope or resource ID is off
 
@@ -44,14 +44,14 @@ Depending on what you find:
 
 - **On a serverless cluster?** Use `SCOPE_RESOURCE_TYPE_SERVERLESS_CLUSTER` instead of `SCOPE_RESOURCE_TYPE_CLUSTER`.
 - **`resource_id` doesn't match?** It must be the bare `<cluster-id>` — never the full proxy URL or the provider name.
-- **Bound at provider scope?** Delete that binding and recreate it at cluster scope (README 3c).
+- **Bound at provider scope?** Delete that binding and recreate it at cluster scope (README 3d).
 
 ### 3. Your token is stale
 
-Permission changes don't apply retroactively to tokens you've already minted. So if you created or edited the binding *after* getting your token, the old token still carries the old (missing) permissions. Just **mint a fresh one** (README 3d) and retry:
+Permission changes don't apply retroactively to tokens you've already minted. So if you created or edited the binding *after* getting your token, the old token still carries the old (missing) permissions. Just **mint a fresh one** (README 3e) and retry:
 
 ```bash
-# Re-run README 3d, then confirm the token isn't empty
+# Re-run README 3e, then confirm the token isn't empty
 test -n "${AUTH_TOKEN}" && test "${AUTH_TOKEN}" != 'null' && echo "token OK"
 ```
 
@@ -65,5 +65,5 @@ test -n "${AUTH_TOKEN}" && test "${AUTH_TOKEN}" != 'null' && echo "token OK"
 
 ## Not a 403?
 
-- **`401 Unauthorized`** — the token is missing, expired, or malformed. Re-mint it (README 3d).
+- **`401 Unauthorized`** — the token is missing, expired, or malformed. Re-mint it (README 3e).
 - **`404 Not Found`** — the proxy URL, provider name, or model ID is wrong. Re-check README 3a and confirm you're using a valid Bedrock inference-profile ID (e.g. `us.anthropic.claude-sonnet-4-6`).

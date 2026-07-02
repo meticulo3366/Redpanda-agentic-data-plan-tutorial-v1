@@ -15,6 +15,16 @@ Everything routes through ADP, so your model keys stay server-side, spend shows 
 
 **Handy links:** [ADP Console](https://ai.redpanda.com) · [Quickstart](https://docs.redpanda.com/agentic-data-plane/get-started/adp-quickstart/) · [Claude Code + ADP](https://docs.redpanda.com/agentic-data-plane/connect/claude-code/)
 
+**What's in this repo:**
+
+| File | What it's for |
+|---|---|
+| `README.md` | This guide — the full end-to-end walkthrough. |
+| [`AWS_BEDROCK_SETUP.md`](./AWS_BEDROCK_SETUP.md) | The AWS-side Bedrock setup you do first (IAM policy, user, keys). |
+| [`adp-claude-code-service-account-auth.sh`](./adp-claude-code-service-account-auth.sh) | One-command automation for Step 3 — creates the service account, binds the role, mints a token, and launches Claude Code. |
+| [`TROUBLESHOOTING.md`](./TROUBLESHOOTING.md) | Fixes for the `403`/`401`/`404` errors you might hit. |
+| [`PRESENTATION_PROMPT.md`](./PRESENTATION_PROMPT.md) | A ready-to-use prompt for generating a slide deck of this whole workflow. |
+
 ---
 
 ## Before you start
@@ -80,6 +90,21 @@ So far the provider works, but nothing outside ADP can reach it yet. This step c
 
 This is the part that trips people up most, so it's broken into small, verifiable steps.
 
+> **Two things are happening here, and it helps to keep them separate:**
+> - **Authentication** — the service account's **Client ID** + **Client Secret** mint a short-lived bearer token that proves *who* you are.
+> - **Authorization** — a Redpanda *role binding* decides *what* that identity is allowed to do. The token's JWT may only show broad scopes like `organization-info`; the actual gateway permission (`dataplane_adp_llmprovider_invoke`) is checked server-side from role bindings, so don't expect to see it in the token itself.
+
+> 🚀 **Fast path — let the script do it.** [`adp-claude-code-service-account-auth.sh`](./adp-claude-code-service-account-auth.sh) automates this entire step: it can create the service account, add the cluster-scope role binding, mint a token, run the smoke test, write Claude Code's settings, and launch Claude Code. First-time run:
+>
+> ```bash
+> export ADMIN_TOKEN='<control-plane-token>'   # see 3b for how to get this
+> export PROXY_URL='https://aigw.<cluster-id>.clusters.rdpa.co/llm/v1/providers/bedrock-adp'
+> ./adp-claude-code-service-account-auth.sh \
+>   --create-service-account --ensure-rbac --smoke-test -- 'say hello'
+> ```
+>
+> It saves credentials to a git-ignored `.adp-claude-code.env`, so later runs are just `./adp-claude-code-service-account-auth.sh -- 'say hello'`. Run `--help` for all options. The manual steps below explain exactly what the script does — walk through them once so you understand the moving parts.
+
 ### 3a. Grab your proxy URL, provider name, and cluster ID
 
 Open **LLM Providers**, click your Bedrock provider, and copy the **Proxy URL** from its **Connection** card. It looks like this:
@@ -98,7 +123,40 @@ export PROXY_URL="https://aigw.${ADP_CLUSTER_ID}.clusters.rdpa.co/llm/v1/provide
 
 The provider name is just the last path segment (`bedrock-adp` here). One thing to watch: when you set up the role binding below, use the bare cluster ID — **not** the full proxy URL.
 
-### 3b. Create a service account
+### 3b. Get a Control Plane admin token (for setup only)
+
+Creating a service account and its role binding are admin operations against `https://api.redpanda.com`, so they need a **Control Plane token** with organization/IAM permissions. This is *only* used for setup — it's a different token from the runtime one Claude Code uses (that comes in 3e).
+
+The repeatable way is to mint one from an existing bootstrap service account that has org-admin rights:
+
+```bash
+export ADMIN_CLIENT_ID='<bootstrap-admin-service-account-client-id>'
+read -rsp 'ADMIN_CLIENT_SECRET: ' ADMIN_CLIENT_SECRET; export ADMIN_CLIENT_SECRET; echo
+
+export ADMIN_TOKEN="$(curl -fsS --request POST \
+  --url 'https://auth.prd.cloud.redpanda.com/oauth/token' \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=client_credentials \
+  --data client_id="${ADMIN_CLIENT_ID}" \
+  --data client_secret="${ADMIN_CLIENT_SECRET}" \
+  --data audience=cloudv2-production.redpanda.cloud | jq -r .access_token)"
+
+test -n "${ADMIN_TOKEN}" && test "${ADMIN_TOKEN}" != 'null'
+```
+
+Before you create anything with it, confirm the token belongs to the **right organization** — the one where your provider lives:
+
+```bash
+curl -fsS 'https://api.redpanda.com/v1/organizations/current' \
+  -H "Authorization: Bearer ${ADMIN_TOKEN}" \
+  | jq '.organization | {id, name}'
+```
+
+If that's the wrong org, stop and mint the token from a service account in the correct one. You can also grab a token interactively from the Cloud API Explorer ("Get token" on any endpoint), but for terminal work the flow above is cleaner.
+
+> **Keep it out of the repo.** Don't commit `ADMIN_CLIENT_SECRET` or `ADMIN_TOKEN`, don't reuse your runtime Claude Code service account as the admin credential, and rotate anything that lands in chat, logs, or a ticket.
+
+### 3c. Create a service account
 
 **In the Redpanda Cloud UI:**
 
@@ -111,7 +169,7 @@ The provider name is just the last path segment (`bedrock-adp` here). One thing 
 curl -fsS --request POST \
   --url 'https://api.redpanda.com/v1/service-accounts' \
   --header 'content-type: application/json' \
-  --header "authorization: Bearer <control-plane-token>" \
+  --header "authorization: Bearer ${ADMIN_TOKEN}" \
   --data '{
     "service_account": {
       "name": "llm-invoker",
@@ -130,7 +188,7 @@ export CLIENT_SECRET='<oauth-client-secret>'
 
 > ⚠️ The **Service Account ID** and the **Client ID** are different values that look alike. Role bindings use the *Service Account ID*. Mixing these up is the #1 cause of the `403` errors in [TROUBLESHOOTING.md](./TROUBLESHOOTING.md).
 
-### 3c. Grant it permission to call the gateway
+### 3d. Grant it permission to call the gateway
 
 The only permission the service account needs is `dataplane_adp_llmprovider_invoke`. That comes bundled in the built-in **`LLMProviderInvoker`** role — the narrowest role for something that just proxies LLM requests.
 
@@ -142,13 +200,11 @@ Scope:     Cluster
 Resource:  <cluster-id>
 ```
 
-> **Why cluster scope?** The `AI Gateway Model Provider` scope looks like the tighter, more "correct" choice — but in testing, a provider-scoped binding is accepted and then the gateway still returns `403 lacks permission dataplane_adp_llmprovider_invoke on provider "<provider-name>"`. Cluster scope is the combination that actually works.
+> **Why cluster scope?** The `AI Gateway Model Provider` scope looks like the tighter, more "correct" choice — but in testing, a provider-scoped binding is accepted and then the gateway still returns `403 lacks permission dataplane_adp_llmprovider_invoke on provider "<provider-name>"`. A temporary `Writer` binding at provider scope failed too. Cluster scope is the combination that actually works. *(If provider-scope least-privilege is important to you, flag it — it's arguably an authorization gap worth confirming with the ADP team.)*
 
-Create the binding through the Control Plane API:
+Create the binding through the Control Plane API (reusing `ADMIN_TOKEN` from 3b):
 
 ```bash
-export ADMIN_TOKEN='<control-plane-token>'
-
 export ROLE_BINDING_ID="$(curl -fsS -X POST 'https://api.redpanda.com/v1/role-bindings' \
   -H "Authorization: Bearer ${ADMIN_TOKEN}" \
   -H 'Content-Type: application/json' \
@@ -163,9 +219,9 @@ echo "Created role binding: ${ROLE_BINDING_ID}"
 
 > On a **serverless** cluster, swap `SCOPE_RESOURCE_TYPE_CLUSTER` for `SCOPE_RESOURCE_TYPE_SERVERLESS_CLUSTER`.
 
-### 3d. Get an access token
+### 3e. Get a runtime access token
 
-Trade the service account's client ID and secret for a short-lived access token:
+Trade the service account's client ID and secret for a short-lived access token. This is the token Claude Code (or your own code) sends to the gateway — **not** the setup-only `ADMIN_TOKEN` from 3b.
 
 ```bash
 export AUTH_TOKEN="$(curl -fsS --request POST \
@@ -182,7 +238,7 @@ test -n "${AUTH_TOKEN}" && test "${AUTH_TOKEN}" != 'null'
 
 These tokens don't live long. Re-run this before a long Claude Code session, or wrap it in a shell function so it's always fresh. (And don't echo the token around — treat it like a password.)
 
-### 3e. Smoke-test the provider
+### 3f. Smoke-test the provider
 
 Before wiring up Claude Code, confirm the token and permissions actually work by calling Bedrock through the gateway directly:
 
@@ -203,9 +259,10 @@ You want to see `HTTP/2 200` and a normal Claude-style reply. If you instead get
 
 - You used the **Client ID** instead of the **Service Account ID** in the role binding.
 - The binding isn't at **cluster scope**, or its `resource_id` doesn't match your `<cluster-id>`.
-- You're using a token minted *before* the role binding existed — grab a fresh one (3d).
+- You're using a token minted *before* the role binding existed — grab a fresh one (3e).
+- The request is hitting a different cluster than the one in the role binding.
 
-### 3f. Point Claude Code at the gateway
+### 3g. Point Claude Code at the gateway
 
 Claude Code speaks the Anthropic API, and it reads its config from environment variables. Point it at your proxy URL and hand it the token:
 
@@ -218,9 +275,9 @@ claude "say hello"
 
 > **Tip:** the provider's **Connect** tab can generate this snippet for you — pick **Claude Code** from the client dropdown and copy what it gives you. Just make sure the base URL matches your provider URL exactly.
 
-If the smoke test in 3e passed but Claude Code doesn't work, the mismatch is usually the provider type or the base URL. Claude Code talks the Anthropic API, whereas a raw Bedrock provider uses Bedrock-style paths like `/model/<model-id>/invoke` (which is exactly what 3e exercised).
+If the smoke test in 3f passed but Claude Code doesn't work, the mismatch is usually the provider type or the base URL. Claude Code talks the Anthropic API, whereas a raw Bedrock provider uses Bedrock-style paths like `/model/<model-id>/invoke` (which is exactly what 3f exercised). If in doubt, check the **Connect** tab for the supported Claude Code configuration.
 
-### 3g. Attach a managed MCP server and confirm
+### 3h. Attach a managed MCP server and confirm
 
 1. Connect the MCP server from Step 2 to Claude Code. OAuth-protected servers pop a one-time consent flow, and tokens get cached in ADP's per-user vault.
 
